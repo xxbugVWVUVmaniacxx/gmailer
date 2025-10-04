@@ -20,11 +20,32 @@ class Gmailer:
         self.logger.setLevel(logging.INFO)
 
         self.SCOPES = scopes
+        self.userId = "me"
         self.service = build(
             serviceName="gmail",
             version="v1",
             credentials=self.get_or_update_credentials(self.SCOPES),
         )
+
+    def get(self, userId="me", msgId=None):
+        return self.service.users().messages().get(userId=userId, id=msgId).execute()
+
+    def safe_delete(self, userId="me", msgId=None):
+        return self.service.users().messages().trash(userId=userId, id=msgId).execute()
+
+    def get_messages(self, maxResults=500, includeSpamTrash=False) -> dict[str, str]:
+        return (
+            self.service.users()
+            .messages()
+            .list(self.userId, maxResults, includeSpamTrash)
+            .execute()
+        )
+
+    def get_more_messages(self, request, response):
+        """
+        this isn't really for users...
+        """
+        return self.service.users().messages().list_next(request, response)
 
     def get_all_messages(self, request):
         all_messages = []
@@ -32,7 +53,7 @@ class Gmailer:
             response = request.execute()
             messages = response.get("messages", [])
             all_messages.extend(messages)
-            response = self.service.users().messages().list_next(request, response)
+            request = self.get_more_messages(request, response)
         return all_messages
 
     def get_message_metadata(self, messages):
