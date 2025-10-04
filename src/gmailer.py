@@ -14,34 +14,8 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import BatchHttpRequest
 
 
-class Util:
-    @staticmethod
-    def get_or_update_credentials(SCOPES):
-        TOKEN = "token.json"
-        CREDENTIALS = "credentials.json"
-
-        if os.path.exists(TOKEN):
-            creds = Credentials.from_authorized_user_file(TOKEN, SCOPES)
-
-        # not exists or invalid, get creds
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
-                creds = flow.run_local_server(port=0)
-            # Save the credentials for the next run
-            with open(TOKEN, "w") as token:
-                token.write(creds.to_json())
-        return creds
-
-    @staticmethod
-    def toJson(res):
-        return json.dumps(res, sort_keys=True, indent=4)
-
-
 class Gmailer:
-    def __init__(self, scopes=["https://www.main.google.com"]):
+    def __init__(self, scopes=["https://mail.google.com/"]):
         self.logger = logging.getLogger()
         self.logger.setLevel(logging.INFO)
 
@@ -49,23 +23,7 @@ class Gmailer:
         self.service = build(
             serviceName="gmail",
             version="v1",
-            credentials=Util.get_or_update_credentials(self.SCOPES),
-        )
-
-    def build_get_messages_request(
-        self, userId="me", maxResults=500, includeSpamTrash=False
-    ):
-        return (
-            self.service.users().messages().list(userId, maxResults, includeSpamTrash)
-        )
-
-    def build_get_more_messages_request(self, previous_request, previous_response):
-        return (
-            self.service.users()
-            .messages()
-            .list_next(
-                previous_request=previous_request, previous_response=previous_response
-            )
+            credentials=self.get_or_update_credentials(self.SCOPES),
         )
 
     def get_all_messages(self, request):
@@ -74,40 +32,34 @@ class Gmailer:
             response = request.execute()
             messages = response.get("messages", [])
             all_messages.extend(messages)
-            request = self.build_get_more_messages_request(request, response)
+            response = self.service.users().messages().list_next(request, response)
         return all_messages
 
-    def save_as(self, file_name, content):
-        with open(file_name, "w") as f:
-            json.dump(content, f, indent=4)
-
-    def get_sender_counts(self, sorted_senders):
-        # Convert list of tuples to a more readable list of dicts for JSON
-        json_output = [
-            {"sender": email, "count": count} for email, count in sorted_senders
-        ]
-        self.save_as("sender_counts.json", json_output)
-        print(
-            f"Saved sender counts for {len(sorted_senders)} unique senders to sender_counts.json"
-        )
-
     def get_message_metadata(self, messages):
-        return get_message_metadata_in_batch(self.service, messages, ["From"])
+        return self.get_message_metadata_in_batch(messages, ["From"])
 
     def get_senders_by_count(
         self,
-    ):
-        request = self.build_get_messages_request(self.service)
+    ) -> list[tuple[str, int]]:
+        # no need to spin the machines
+        if os.path.exists("sender_counts.json"):
+            with open("sender_counts.json", "r") as f:
+                return json.load(f)
 
+        # ok spin em
+        request = (
+            self.service.users()
+            .messages()
+            .list(userId="me", maxResults=500, includeSpamTrash=False)
+        )
         all_messages = self.get_all_messages(request)
         if not all_messages:
             print("No messages found.")
-            return
+            return []
 
         message_metadata = self.get_message_metadata_in_batch(all_messages)
         if not message_metadata:
             print("no message metadata")
-            return
 
         sender_emails = self.get_senders_from_metadata(message_metadata)
 
@@ -116,8 +68,12 @@ class Gmailer:
         sorted_senders = sender_counts.most_common()
 
         self.save_as("sender_counts.json", sorted_senders)
+        print(f"saving {len(sorted_senders)} sender_counts.")
+        return sorted_senders
 
-    def get_message_metadata_in_batch(self, messages, headers=None):
+    def get_message_metadata_in_batch(
+        self, messages, headers=["Accept-Encoding: gzip"]
+    ):
         """
         Fetches metadata for a list of messages using batch requests for efficiency,
         with exponential backoff for rate-limiting errors.
@@ -181,7 +137,7 @@ class Gmailer:
 
         return metadata
 
-    def get_senders_from_metadata(self, message_metadata):
+    def get_senders_from_metadata(self, message_metadata: dict):
         """
         Extracts a list of sender email addresses from the message metadata.
         """
@@ -193,7 +149,36 @@ class Gmailer:
             )
             if from_header:
                 # parseaddr returns a (name, email) tuple, we want the email part
-                name, email_addr = parseaddr(from_header)
+                _, email_addr = parseaddr(from_header)
                 if email_addr:
                     sender_emails.append(email_addr)
         return sender_emails
+
+    def get_or_update_credentials(self, SCOPES):
+        TOKEN = ".env/token.json"
+        CREDENTIALS = ".env/credentials.json"
+        creds = None
+
+        if os.path.exists(TOKEN):
+            creds = Credentials.from_authorized_user_file(TOKEN, SCOPES)
+
+        # not exists or invalid, get creds
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
+                creds = flow.run_local_server(port=0)
+            # Save the credentials for the next run
+            with open(TOKEN, "w") as token:
+                token.write(creds.to_json())
+        return creds
+
+    @staticmethod
+    def to_json(res):
+        return json.dumps(res, sort_keys=True, indent=4)
+
+    @staticmethod
+    def save_as(file_name, content):
+        with open(file_name, "w") as f:
+            json.dump(content, f, indent=4)
