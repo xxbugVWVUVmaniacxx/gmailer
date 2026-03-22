@@ -2,7 +2,7 @@
 
 ## What this is
 
-A command-line tool for bulk Gmail inbox cleanup. It fetches all message IDs, groups them by sender, and lets you see your top senders or delete all messages from a specific sender. Deletion moves messages to Trash — not permanent — so you have a recovery window before Gmail auto-purges.
+A command-line tool for bulk Gmail inbox cleanup. It fetches all message metadata and stores it in a local SQLite database (`src/messages.db`), then lets you query top senders or delete all messages from a specific sender. Deletion moves messages to Trash — not permanent — so you have a recovery window before Gmail auto-purges.
 
 ## Prerequisites
 
@@ -31,7 +31,7 @@ The first run opens a browser window for OAuth consent. After you approve, the t
 Run from the repo root with the virtual environment (venv) active:
 
 ```bash
-# Show top 20 senders by message count
+# Show top 20 senders by message count (fetches and stores all metadata on first run)
 python3 src/gmailer.py --top 20
 
 # Preview what would be deleted (dry run — safe, no changes made)
