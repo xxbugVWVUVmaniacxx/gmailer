@@ -1,0 +1,7 @@
+.*
+!.kiro/
+__*__
+test*
+message_ids.json
+sender_counts.json
+src/.env/

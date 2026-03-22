@@ -2,10 +2,10 @@
 
 import json
 import logging
-import os.path
 import time
 from collections import Counter, defaultdict
 from email.utils import parseaddr
+from pathlib import Path
 
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -14,9 +14,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import BatchHttpRequest
-from ratelimit import limits, sleep_and_retry
 
 MAX_TPS = 50  # google batch limit (50TPS for messages.get and messages.list)
+
+_BASE = Path(__file__).parent
 
 
 class Gmailer:
@@ -26,11 +27,11 @@ class Gmailer:
     """
 
     def __get_or_update_credentials(self, SCOPES):
-        TOKEN = ".env/token.json"
-        CREDENTIALS = ".env/credentials.json"
+        TOKEN = _BASE / ".env/token.json"
+        CREDENTIALS = _BASE / ".env/credentials.json"
         creds = None
 
-        if os.path.exists(TOKEN):
+        if TOKEN.exists():
             creds = Credentials.from_authorized_user_file(TOKEN, SCOPES)
 
         # not exists or invalid, get creds
@@ -39,7 +40,7 @@ class Gmailer:
                 try:
                     creds.refresh(Request())
                 except RefreshError:
-                    os.remove(TOKEN)
+                    TOKEN.unlink()
                     creds.refresh(Request())
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
@@ -97,14 +98,13 @@ class Gmailer:
     def safe_delete(self, userId="me", msgId=None):
         return self.service.users().messages().trash(userId=userId, id=msgId).execute()
 
-    @sleep_and_retry
-    @limits(calls=MAX_TPS, period=1)
     def get_message_ids(self, cached_ok=False) -> list[str]:
+        cache_path = _BASE / "message_ids.json"
         # cached check
-        if cached_ok and os.path.exists("message_ids.json"):
+        if cached_ok and cache_path.exists():
             print("found existing message ids. loading...")
             time.sleep(2)
-            with open("message_ids.json", "r") as f:
+            with open(cache_path, "r") as f:
                 return json.load(f)
 
         message_ids = []
@@ -135,11 +135,10 @@ class Gmailer:
         exponential retry backoff
         """
         sender_map = defaultdict(list)
-        pay_structure = None
 
         def callback(request_id: str, response: dict, exception):
-            if pay_structure is not None:
-                print("then we can talk")
+            if response is None:
+                return
             email, id = self.get_emails_from_metadata(response)
             sender_map[email].append(id)
 
@@ -163,7 +162,6 @@ class Gmailer:
         """
         Extracts a list of sender email addresses from the message metadata.
         """
-        print(f"mmd:{message_metadata}")
         headers = message_metadata.get("payload", {}).get("headers", [])
         id = message_metadata.get("id")
         from_header = next(
@@ -186,25 +184,63 @@ class Gmailer:
         with open(file_name, "w") as f:
             json.dump(content, f, indent=4)
 
+    def delete_by_sender(self, email: str, dry_run: bool = True):
+        message_ids = self.get_message_ids(cached_ok=True)
+        sender_map = self.get_sender_counts(message_ids)
+        ids = sender_map.get(email, [])
+        if not ids:
+            print(f"No messages found for {email}")
+            return
+        if dry_run:
+            print(f"Would delete {len(ids)} messages from {email}")
+            print(f"Sample IDs: {ids[:3]}")
+            return
+        for i, id in enumerate(ids, 1):
+            self.safe_delete(msgId=id)
+            if i % 50 == 0:
+                print(f"Deleted {i}/{len(ids)}...")
+        print(f"Done. Deleted {len(ids)} messages from {email}.")
+
     def get_top_senders(self, ranks=20) -> list[tuple[str, int]]:
+        cache_path = _BASE / "sender_counts.json"
         # no need to spin the machines
-        if os.path.exists("sender_counts.json"):
+        if cache_path.exists():
             print("found existing sender counts. loading...")
             time.sleep(2)
-            with open("sender_counts.json", "r") as f:
-                return json.load(f)
+            with open(cache_path, "r") as f:
+                return Counter(json.load(f)).most_common(ranks)
 
         # ok spin em
-        message_ids = self.get_message_ids()
-        self.save_as("message_ids.json", message_ids)
+        message_ids = self.get_message_ids(cached_ok=True)
+        self.save_as(_BASE / "message_ids.json", message_ids)
 
         sender_emails = self.get_sender_counts(message_ids)
         sender_counts = Counter(
             {email: len(ids) for email, ids in sender_emails.items()}
         )
         # most_common() returns a list of (email, count) tuples, sorted by count
-        sorted_senders = sender_counts.most_common()
+        sorted_senders = sender_counts.most_common(ranks)
 
-        self.save_as("sender_counts.json", sender_counts)
+        self.save_as(cache_path, sender_counts)
         print(f"saving {len(sender_counts)} sender_counts.")
         return sorted_senders
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Gmailer CLI")
+    parser.add_argument("--top", type=int, default=20, metavar="N", help="Print top N senders")
+    parser.add_argument("--delete", metavar="EMAIL", help="Delete all messages from EMAIL")
+    parser.add_argument("--confirm", action="store_true", help="Required to execute deletion")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
+    args = parser.parse_args()
+
+    g = Gmailer()
+
+    if args.delete:
+        dry = not args.confirm or args.dry_run
+        g.delete_by_sender(args.delete, dry_run=dry)
+    else:
+        for email, count in g.get_top_senders(args.top):
+            print(f"{count:>6}  {email}")
