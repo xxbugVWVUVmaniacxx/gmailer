@@ -61,3 +61,6 @@ Sample IDs: ['abc123', 'def456', 'ghi789']
 - `--delete` without `--confirm` always runs as a dry run — no messages are touched.
 - Deletion uses Gmail's `trash` API (Application Programming Interface) call (`safe_delete`), which moves messages to Trash. This is **not** permanent deletion.
 - To permanently delete, empty Trash via the Gmail UI or a separate API call. This tool does not do that.
+
+<!-- end -->
+<!-- end -->
