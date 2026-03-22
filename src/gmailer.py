@@ -218,6 +218,28 @@ class Gmailer:
                 print(f"Deleted {i}/{len(ids)}...")
         print(f"Done. Deleted {len(ids)} messages from {email}.")
 
+    def delete_by_sender_direct(self, email: str, dry_run: bool = True):
+        ids = []
+        req = self.service.users().messages().list(
+            userId=self.userId, q=f"from:{email}", maxResults=500
+        )
+        while req is not None:
+            res = req.execute()
+            ids.extend(m["id"] for m in res.get("messages", []))
+            req = self.service.users().messages().list_next(req, res)
+        if not ids:
+            print(f"No messages found for {email}")
+            return
+        if dry_run:
+            print(f"Would delete {len(ids)} messages from {email}")
+            print(f"Sample IDs: {ids[:3]}")
+            return
+        for i, id in enumerate(ids, 1):
+            self.safe_delete(msgId=id)
+            if i % 50 == 0:
+                print(f"Deleted {i}/{len(ids)}...")
+        print(f"Done. Deleted {len(ids)} messages from {email}.")
+
     @staticmethod
     def to_json(res):
         return json.dumps(res, sort_keys=True, indent=4)
@@ -229,6 +251,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gmailer CLI")
     parser.add_argument("--top", type=int, default=20, metavar="N", help="Print top N senders")
     parser.add_argument("--delete", metavar="EMAIL", help="Delete all messages from EMAIL")
+    parser.add_argument("--delete-direct", metavar="EMAIL", help="Delete all messages from EMAIL via live API query (no DB required)")
     parser.add_argument("--confirm", action="store_true", help="Required to execute deletion")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted")
     args = parser.parse_args()
@@ -238,6 +261,9 @@ if __name__ == "__main__":
     if args.delete:
         dry = not args.confirm or args.dry_run
         g.delete_by_sender(args.delete, dry_run=dry)
+    elif args.delete_direct:
+        dry = not args.confirm or args.dry_run
+        g.delete_by_sender_direct(args.delete_direct, dry_run=dry)
     else:
         for email, count in g.get_top_senders(args.top):
             print(f"{count:>6}  {email}")
