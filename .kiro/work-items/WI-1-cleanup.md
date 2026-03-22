@@ -13,7 +13,7 @@ triggers: WI-2
 Remove dead code, fix type mismatches, harden path resolution, and update `.gitignore` so the codebase reflects only intentional, working logic.
 
 ## prereq
-- Working directory: `/Users/radlad/code/gmailer`
+- Working directory: repo root
 - Python venv active: `source .venv/bin/activate`
 
 ## steps
