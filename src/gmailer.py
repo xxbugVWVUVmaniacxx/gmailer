@@ -2,8 +2,8 @@
 
 import json
 import logging
+import sqlite3
 import time
-from collections import Counter, defaultdict
 from email.utils import parseaddr
 from pathlib import Path
 
@@ -64,7 +64,6 @@ class Gmailer:
 
     ###########################################################################
     # Request convenience methods
-    # TODO add more
     ###########################################################################
 
     def __list_messages_request(self):
@@ -85,7 +84,7 @@ class Gmailer:
                 userId=self.userId,
                 id=message_id,
                 format="metadata",
-                metadataHeaders=["From"],
+                metadataHeaders=["From", "Subject"],
             )
         )
 
@@ -127,67 +126,85 @@ class Gmailer:
 
         return message_ids
 
-    def get_sender_counts(
-        self, message_ids: list[str], batch_size=MAX_TPS
-    ) -> dict[str, list[str]]:
-        """
-        batch fetches "From" values for a list of messages
-        exponential retry backoff
-        """
-        sender_map = defaultdict(list)
+    def _init_db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(_BASE / "messages.db", check_same_thread=False)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id            TEXT PRIMARY KEY,
+                thread_id     TEXT,
+                sender        TEXT,
+                subject       TEXT,
+                internal_date INTEGER,
+                size_estimate INTEGER,
+                label_ids     TEXT,
+                fetched_at    INTEGER
+            )
+        """)
+        conn.commit()
+        return conn
+
+    def _upsert_messages(self, conn: sqlite3.Connection, rows: list[dict]):
+        conn.executemany(
+            "INSERT OR REPLACE INTO messages VALUES (:id, :thread_id, :sender, :subject, :internal_date, :size_estimate, :label_ids, :fetched_at)",
+            rows,
+        )
+        conn.commit()
+
+    def _parse_message(self, response: dict) -> dict:
+        headers = response.get("payload", {}).get("headers", [])
+        from_header = next((h["value"] for h in headers if h["name"].lower() == "from"), None)
+        subject = next((h["value"] for h in headers if h["name"].lower() == "subject"), "")
+        _, sender = parseaddr(from_header) if from_header else (None, "unknown@email.address")
+        return {
+            "id": response.get("id"),
+            "thread_id": response.get("threadId"),
+            "sender": sender or "unknown@email.address",
+            "subject": subject,
+            "internal_date": int(response.get("internalDate", 0)),
+            "size_estimate": response.get("sizeEstimate"),
+            "label_ids": json.dumps(response.get("labelIds", [])),
+            "fetched_at": int(time.time() * 1000),
+        }
+
+    def fetch_and_store(self, message_ids: list[str], flush_every=100):
+        conn = self._init_db()
+        pending = []
+        batch_number = 0
 
         def callback(request_id: str, response: dict, exception):
             if response is None:
                 return
-            email, id = self.get_emails_from_metadata(response)
-            sender_map[email].append(id)
+            pending.append(self._parse_message(response))
 
         for i in range(0, len(message_ids), MAX_TPS):
-            batch: BatchHttpRequest = self.service.new_batch_http_request(
-                callback=callback
-            )
-            id_chunk: list = message_ids[i : i + MAX_TPS]
-            for id in id_chunk:
-                req = self.__get_sender_request(id)
-                batch.add(req)
-            print(f"sending batch no. {i // MAX_TPS + 1}")
+            batch: BatchHttpRequest = self.service.new_batch_http_request(callback=callback)
+            for id in message_ids[i : i + MAX_TPS]:
+                batch.add(self.__get_sender_request(id))
+            batch_number += 1
+            print(f"sending batch no. {batch_number}")
             batch.execute()
-            time.sleep(
-                5
-            )  # rudimentary delay while we implement rate limiting on this method
+            time.sleep(5)
+            if batch_number % flush_every == 0:
+                self._upsert_messages(conn, pending)
+                pending.clear()
 
-        return sender_map
+        if pending:
+            self._upsert_messages(conn, pending)
+        conn.close()
 
-    def get_emails_from_metadata(self, message_metadata: dict):
-        """
-        Extracts a list of sender email addresses from the message metadata.
-        """
-        headers = message_metadata.get("payload", {}).get("headers", [])
-        id = message_metadata.get("id")
-        from_header = next(
-            (h["value"] for h in headers if h["name"].lower() == "from"), None
-        )
-        if from_header:
-            # parseaddr returns a (name, email) tuple, we want the email part
-            _, email_addr = parseaddr(from_header)
-            if email_addr:
-                return email_addr, id
-
-        return "unknown@email.address", id
-
-    @staticmethod
-    def to_json(res):
-        return json.dumps(res, sort_keys=True, indent=4)
-
-    @staticmethod
-    def save_as(file_name, content):
-        with open(file_name, "w") as f:
-            json.dump(content, f, indent=4)
+    def get_top_senders(self, ranks=20) -> list[tuple[str, int]]:
+        conn = self._init_db()
+        rows = conn.execute(
+            "SELECT sender, COUNT(*) as cnt FROM messages GROUP BY sender ORDER BY cnt DESC LIMIT ?",
+            (ranks,),
+        ).fetchall()
+        conn.close()
+        return rows
 
     def delete_by_sender(self, email: str, dry_run: bool = True):
-        message_ids = self.get_message_ids(cached_ok=True)
-        sender_map = self.get_sender_counts(message_ids)
-        ids = sender_map.get(email, [])
+        conn = self._init_db()
+        ids = [r[0] for r in conn.execute("SELECT id FROM messages WHERE sender = ?", (email,)).fetchall()]
+        conn.close()
         if not ids:
             print(f"No messages found for {email}")
             return
@@ -201,29 +218,9 @@ class Gmailer:
                 print(f"Deleted {i}/{len(ids)}...")
         print(f"Done. Deleted {len(ids)} messages from {email}.")
 
-    def get_top_senders(self, ranks=20) -> list[tuple[str, int]]:
-        cache_path = _BASE / "sender_counts.json"
-        # no need to spin the machines
-        if cache_path.exists():
-            print("found existing sender counts. loading...")
-            time.sleep(2)
-            with open(cache_path, "r") as f:
-                return Counter(json.load(f)).most_common(ranks)
-
-        # ok spin em
-        message_ids = self.get_message_ids(cached_ok=True)
-        self.save_as(_BASE / "message_ids.json", message_ids)
-
-        sender_emails = self.get_sender_counts(message_ids)
-        sender_counts = Counter(
-            {email: len(ids) for email, ids in sender_emails.items()}
-        )
-        # most_common() returns a list of (email, count) tuples, sorted by count
-        sorted_senders = sender_counts.most_common(ranks)
-
-        self.save_as(cache_path, sender_counts)
-        print(f"saving {len(sender_counts)} sender_counts.")
-        return sorted_senders
+    @staticmethod
+    def to_json(res):
+        return json.dumps(res, sort_keys=True, indent=4)
 
 
 if __name__ == "__main__":

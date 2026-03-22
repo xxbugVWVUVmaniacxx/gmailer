@@ -3,5 +3,5 @@
 __*__
 test*
 message_ids.json
-sender_counts.json
+src/messages.db
 src/.env/
